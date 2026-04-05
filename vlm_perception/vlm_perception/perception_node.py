@@ -103,19 +103,24 @@ class PerceptionNode(Node):
         self._depth_image = None         # latest aligned depth (numpy uint16)
         self._camera_info = None         # latest CameraInfo
         self._color_header = None        # header from latest color msg
+        
+        # Counters for debug
+        self._color_count = 0
+        self._depth_count = 0
+        self._info_count = 0
 
         # ── Subscribers ───────────────────────────────────────────────
         self.create_subscription(
             String, "/target_object", self._on_target, 10
         )
         self.create_subscription(
-            Image, "/camera/color/image_raw", self._on_color, 10
+            Image, "/camera/camera/color/image_raw", self._on_color, 10
         )
         self.create_subscription(
-            Image, "/camera/aligned_depth_to_color/image_raw", self._on_depth, 10
+            Image, "/camera/camera/aligned_depth_to_color/image_raw", self._on_depth, 10
         )
         self.create_subscription(
-            CameraInfo, "/camera/color/camera_info", self._on_cam_info, 10
+            CameraInfo, "/camera/camera/color/camera_info", self._on_cam_info, 10
         )
 
         # ── Publishers ────────────────────────────────────────────────
@@ -142,13 +147,22 @@ class PerceptionNode(Node):
             self._target_text = text
 
     def _on_color(self, msg: Image):
+        self._color_count += 1
+        # if self._color_count % 10 == 0:
+        #     self.get_logger().info(f"Received {self._color_count} color frames", throttle_duration_sec=5.0)
         self._color_image = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         self._color_header = msg.header
 
     def _on_depth(self, msg: Image):
+        self._depth_count += 1
+        # if self._depth_count % 10 == 0:
+        #     self.get_logger().info(f"Received {self._depth_count} depth frames", throttle_duration_sec=5.0)
         self._depth_image = self._bridge.imgmsg_to_cv2(msg, desired_encoding="16UC1")
 
     def _on_cam_info(self, msg: CameraInfo):
+        self._info_count += 1
+        # if self._info_count % 10 == 0:
+        #     self.get_logger().info(f"Received {self._info_count} cam_info msgs", throttle_duration_sec=5.0)
         self._camera_info = msg
 
     # ── Main processing loop (rate-controlled) ────────────────────────
@@ -157,9 +171,14 @@ class PerceptionNode(Node):
         # Gate: need target + color + depth + intrinsics
         if not self._target_text:
             return
-        if self._color_image is None or self._depth_image is None:
-            return
-        if self._camera_info is None:
+        
+        missing = []
+        if self._color_image is None: missing.append("color")
+        if self._depth_image is None: missing.append("depth")
+        if self._camera_info is None: missing.append("cam_info")
+        
+        if missing:
+            self.get_logger().info(f"Waiting for topics: {', '.join(missing)}", throttle_duration_sec=5.0)
             return
 
         t_start = time.time()
