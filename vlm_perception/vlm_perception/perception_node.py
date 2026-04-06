@@ -36,21 +36,7 @@ from cv_bridge import CvBridge
 # Assumes workspace is ~/semgrasp (adjust if needed)
 _WS = os.path.expanduser("~/semgrasp")
 
-GROUNDING_CONFIG = os.path.join(
-    _WS, "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
-)
-GROUNDING_WEIGHTS = os.path.join(
-    _WS, "GroundingDINO/weights/groundingdino_swint_ogc.pth"
-)
-SAM_CHECKPOINT = os.path.join(
-    _WS, "MobileSAM/weights/mobile_sam.pt"
-)
-
-# Add to path so imports work inside venv
-sys.path.insert(0, os.path.join(_WS, "GroundingDINO"))
-sys.path.insert(0, os.path.join(_WS, "MobileSAM"))
-
-from groundingdino.util.inference import load_model, load_image, predict
+from ultralytics import YOLO
 from mobile_sam import sam_model_registry, SamPredictor
 
 
@@ -77,14 +63,17 @@ class PerceptionNode(Node):
         self.get_logger().info(f"Device: {self._device}")
 
         # ── Load models ───────────────────────────────────────────────
-        self.get_logger().info("Loading GroundingDINO...")
+        self.get_logger().info("Loading YOLO-World-S...")
         t0 = time.time()
-        self._grounding = load_model(GROUNDING_CONFIG, GROUNDING_WEIGHTS)
-        self.get_logger().info(f"GroundingDINO loaded in {time.time()-t0:.2f}s")
+        self._yolo = YOLO("yolov8s-worldv2.pt")
+        self._yolo.to(self._device)
+        self.get_logger().info(f"YOLO-World-S loaded in {time.time()-t0:.2f}s")
 
         self.get_logger().info("Loading MobileSAM...")
         t0 = time.time()
-        sam = sam_model_registry["vit_t"](checkpoint=SAM_CHECKPOINT)
+        _WS = os.path.expanduser("~/semgrasp")
+        sam_checkpoint = os.path.join(_WS, "MobileSAM/weights/mobile_sam.pt")
+        sam = sam_model_registry["vit_t"](checkpoint=sam_checkpoint)
         sam.to(self._device)
         sam.eval()
         self._predictor = SamPredictor(sam)
@@ -112,8 +101,7 @@ class PerceptionNode(Node):
         self._frame_count = 0
         self._last_box_xyxy_resized = None # stored as [x1, y1, x2, y2] in 640x480
         self._last_centroid = None         # stored as [x, y, z] np.array
-        self._last_phrases = None
-        self._last_logits = None
+        self._last_conf = 0.0
         self._fallback_count = 0           # frames since last valid detection
 
         # ── Subscribers ───────────────────────────────────────────────
@@ -152,6 +140,8 @@ class PerceptionNode(Node):
         if text != self._target_text:
             self.get_logger().info(f'Target object set: "{text}"')
             self._target_text = text
+            # Update YOLO-World classes for open-vocabulary detection
+            self._yolo.set_classes([text])
 
     def _on_color(self, msg: Image):
         self._color_count += 1
@@ -198,64 +188,35 @@ class PerceptionNode(Node):
         h_orig, w_orig = color.shape[:2]
         color_resized = cv2.resize(color, (640, 480))
 
-        # ── GroundingDINO detection ───────────────────────────────────
-        # load_image expects a file path; we use raw numpy instead
+        # ── YOLO-World-S detection ────────────────────────────────────
         image_rgb = cv2.cvtColor(color_resized, cv2.COLOR_BGR2RGB)
-
-        # Prepare image tensor the way GroundingDINO expects
-        import groundingdino.datasets.transforms as T
-        transform = T.Compose([
-            T.RandomResize([800], max_size=1333),
-            T.ToTensor(),
-            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
-        from PIL import Image as PILImage
-        pil_image = PILImage.fromarray(image_rgb)
-        image_tensor, _ = transform(pil_image, None)
-
-        self._frame_count += 1
-        run_detection = (self._frame_count % 3 == 0) or (self._last_box_xyxy_resized is None)
-
-        # ── Detection / Tracking Block ────────────────────────────────
+ 
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=(self._device == "cuda")):
-                if run_detection:
-                    # Execute heavy GroundingDINO detection
-                    boxes, logits, phrases = predict(
-                        model=self._grounding,
-                        image=image_tensor,
-                        caption=text,
-                        box_threshold=self._box_thresh,
-                        text_threshold=self._text_thresh,
-                    )
-
-                    if len(boxes) > 0 and logits[0] >= self._box_thresh:
-                        # Success: Use new box
-                        self._fallback_count = 0
-                        box = boxes[0]
-                        cx, cy, bw, bh = box
-                        x1_r = (cx - bw / 2) * 640
-                        y1_r = (cy - bh / 2) * 480
-                        x2_r = (cx + bw / 2) * 640
-                        y2_r = (cy + bh / 2) * 480
-                        self._last_box_xyxy_resized = np.array([x1_r, y1_r, x2_r, y2_r])
-                        self._last_logits = logits[:1]
-                        self._last_phrases = phrases[:1]
-                    else:
-                        # Detection failed: Try fallback
-                        if self._last_box_xyxy_resized is not None and self._fallback_count < 3:
-                            self._fallback_count += 1
-                            self.get_logger().warn(f'Detection lost. Fallback ({self._fallback_count}/3)', throttle_duration_sec=1.0)
-                        else:
-                            self.get_logger().warn(f'No detection for "{text}"', throttle_duration_sec=5.0)
-                            self._last_box_xyxy_resized = None
-                            return
+                # Run YOLO-World-S inference
+                results = self._yolo.predict(
+                    image_rgb,
+                    conf=self._box_thresh,
+                    imgsz=640,
+                    verbose=False
+                )
+ 
+                if len(results[0].boxes) > 0:
+                    # Success: Use top-1 box
+                    self._fallback_count = 0
+                    box_xyxy = results[0].boxes.xyxy[0].cpu().numpy()
+                    self._last_box_xyxy_resized = box_xyxy
+                    self._last_conf = float(results[0].boxes.conf[0])
                 else:
-                    # Skipping DINO: Use previous box
-                    if self._last_box_xyxy_resized is None:
-                        return # safety
-                    # self.get_logger().info("Skipping detection (reuse last box)", throttle_duration_sec=2.0)
-
+                    # Detection failed: Try fallback
+                    if self._last_box_xyxy_resized is not None and self._fallback_count < 3:
+                        self._fallback_count += 1
+                        self.get_logger().warn(f'Detection lost. Fallback ({self._fallback_count}/3)', throttle_duration_sec=1.0)
+                    else:
+                        self.get_logger().warn(f'No detection for "{text}"', throttle_duration_sec=5.0)
+                        self._last_box_xyxy_resized = None
+                        return
+ 
         det_time = time.time() - t_start
 
         # ── MobileSAM segmentation (on resized image) ─────────────────
@@ -320,19 +281,8 @@ class PerceptionNode(Node):
         # ── Compute and publish centroid ──────────────────────────────
         centroid = points_3d.mean(axis=0)
 
-        # ── Stability Check: Adaptive Distance Threshold ──────────────
-        current_z = float(centroid[2])
-        if self._last_centroid is not None:
-            dist = np.linalg.norm(centroid - self._last_centroid)
-            adaptive_thresh = 0.1 + 0.2 * current_z
-            if dist > adaptive_thresh:
-                self.get_logger().warn(
-                    f"Centroid jump detected: {dist:.3f}m > limit {adaptive_thresh:.3f}m. Rejecting frame.",
-                    throttle_duration_sec=1.0
-                )
-                return
-        
         self._last_centroid = centroid
+        current_z = float(centroid[2])
 
         centroid_msg = PointStamped()
         centroid_msg.header = self._make_header()
@@ -352,7 +302,7 @@ class PerceptionNode(Node):
         cv2.rectangle(annotated, (x1_o, y1_o), (x2_o, y2_o), (0, 255, 0), 2)
         cv2.putText(
             annotated,
-            f"{self._last_phrases[0]} {self._last_logits[0]:.2f}",
+            f"{text} {self._last_conf:.2f}",
             (x1_o, y1_o - 10),
             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
         )
@@ -366,9 +316,8 @@ class PerceptionNode(Node):
 
         total_time = time.time() - t_start
         self.get_logger().info(
-            f'[{text}] conf={self._last_logits[0]:.2f} pts={len(points_3d)} '
-            f'centroid=({centroid[0]:.3f},{centroid[1]:.3f},{centroid[2]:.3f}) '
-            f'det={det_time:.2f}s seg={seg_time:.2f}s total={total_time:.2f}s'
+            f'[{text}] YOLO={det_time:.3f}s SAM={seg_time:.3f}s Total={total_time:.3f}s '
+            f'conf={self._last_conf:.2f} centroid=({centroid[0]:.3f},{centroid[1]:.3f},{centroid[2]:.3f})'
         )
 
     # ── Helpers ───────────────────────────────────────────────────────
